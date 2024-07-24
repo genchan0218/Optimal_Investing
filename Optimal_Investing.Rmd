@@ -1,0 +1,281 @@
+---
+title: "Optimal Investing"
+author: "Genki Hirayama"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyquant)
+library(timetk)
+library(tidyverse)
+library(PerformanceAnalytics)
+library(quadprog)
+library(data.table)
+library(quantmod)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+library(RColorBrewer)
+library(corrplot)
+
+generate_random_weights <- function(n, allow_short = TRUE) {
+  if (allow_short) {
+    # Generate random weights with short selling allowed
+    my_sample <- cumsum(runif(n, min = -1, max = 1))
+  } else {
+    # Generate random weights with short selling not allowed
+    my_sample <- cumsum(runif(n))
+  }
+  my_sample <- c(0, my_sample / max(my_sample))
+  weights <- diff(my_sample) * 1
+  return(weights / sum(weights))
+}
+
+# Download stock price data
+get_stock_data <- function(ticker) {
+  temp_stock_data <- setDT(tq_get(ticker,
+               from = start_date,
+               to = end_date,
+               get = "stock.prices"))
+  return(temp_stock_data)
+}
+
+# Calculate downside deviation for Sortino ratio
+downside_deviation <- function(returns, target = risk_free_rate) {
+  sqrt(mean(pmin(returns - target, 0)^2))
+}
+```
+
+## A) Download stock price data for 10+ equities from free online sources.
+Downloaded stock price using tiyquant package in R (sourced from Yahoo Finance). I used the daily data ranging between 2021 Jan 1st and 2023 Dec 31st for this analysis. Please see the list of tickers selected for analysis in the script. I picked the date range post COVID years to take out significant impact from the event. 
+
+```{r a - download stock price , echo = T}
+
+
+# Define the stock tickers you want to analyze
+tickers <- c("NEE", "DG", "DHR", "MSFT","AMZN", "SHW", "ICE","MKC", "CLX", "AON", "JKHY", "MSI", "VRTX", "UNP", "GOOGL", "JNJ", "NVDA", "CCOI", "KOS", "VRSN", "CHE", "SAIA", "MPWR", "ENTG")
+
+# Define the start and end date for the data
+start_date <- as.Date("2020-01-01")
+end_date <- as.Date("2024-01-01")
+
+stock_data <- lapply(tickers, get_stock_data)
+prices <- rbindlist(stock_data)[,c("symbol", "date", "adjusted")]
+prices
+```
+
+## B) Use these stocks to compute a mean-variance efficient frontier. While mean-variance optimization is built into a lot of software packages, using a generic optimization package with the correct objective function and constraints is preferred here. How did you compute the expected return for each stock? The covariance matrix? What start/end date did you use for the return series? What frequency are the returns? Visualize the covariance matrix. Report all the expected returns and covariances as annualized quantities
+
+## b-1) Setting up the stock price data for mean variance optimization
+
+```{r Data Prep 1, echo=TRUE, message = FALSE}
+# Extract adjusted close prices and merge into a single data frame (converted to xts format)
+# Calculate daily returns (without log)
+returns_tidy <- setDT(prices %>%
+                        group_by(symbol) %>%
+                        tq_transmute(select = adjusted,
+                                     mutate_fun = periodReturn,
+                                     period = 'daily',
+                                     col_rename = 'ret'))
+returns_tidy[,ret := 100*ret]
+
+# Convert tidy data to wide format for return series
+ret_xts <- returns_tidy %>%
+  spread(symbol, value = ret) %>%
+  tk_xts()
+
+head(ret_xts, 5)
+
+
+```
+## b-2) Create covariance matrix and plot them
+
+```{r Covar Matrix and mean daily ret, echo=TRUE}
+
+# Plot covariance matrix 
+cov_mat <- cov(ret_xts) 
+melted_cov_mat <- melt(cov_mat)
+cov_plot <- ggplot(data = melted_cov_mat, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(min(melted_cov_mat$value), max(melted_cov_mat$value)), 
+                       name="Covariance (%)") +
+  geom_text(aes(label = round(value, 1)), color = "black", size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Covariance Matrix", x = "", y = "") 
+
+cov_plot
+
+#Calculate mean daily return
+mean_ret <- colMeans(ret_xts, na.rm = TRUE) 
+
+```
+
+## C) Explain what the efficient frontier means. Which portfolio would you invest in and why? 
+
+It represents a set of optimal portfolios that offer the highest expected return for a given level of risk or the lowest risk for a given level of expected return.
+
+I am going to conduct an analysis below to identify my choice of portfolio using sortino ratio. Please note that return value and sortino ratio needs to be annualized if you are comparing against annualized bench mark. (2 is the desired sortion ratio in annual basisEE)
+
+## D) Add short-sale constraints and plot the constrained efficient frontier together with the one from b). Explain any differences you see
+
+
+
+``` {r Calculate efficient frotnier,message=FALSE}
+## set risk-free rate
+getSymbols(Symbols = "DGS3MO", src = "FRED", auto.assign = FALSE) -> treasuries
+risk_free_rate <- as.numeric(last(treasuries)) 
+risk_free_rate <- (1 + risk_free_rate)^(1/360) - 1 #Converted the rate from annualized rate to daily rate
+risk_free_rate <- risk_free_rate
+## Set seed for reproducibility
+set.seed(123)
+# Generate random weights (unconstrained: weights between -1 and 1)
+all_weights_unconstrained <- t(replicate(10000, generate_random_weights(length(tickers), allow_short = TRUE)))
+
+# Convert to data table (unconstrained)
+all_weights_unconstrained <- data.table(all_weights_unconstrained)
+colnames(all_weights_unconstrained) <- tickers
+
+total_run <- length(tickers) * 10000
+random_numbers <- runif(total_run, min = -1, max = 1)
+all_weights_unconstrained <- matrix(random_numbers, nrow = 10000, ncol = length(tickers))
+
+# Normalize the weights to sum to 1 (unconstrained)
+for (i in 1:10000) {
+  all_weights_unconstrained[i, ] <- all_weights_unconstrained[i, ] / sum(abs(all_weights_unconstrained[i, ]))
+}
+
+# Convert to data table (unconstrained) and check all the weights are equaling to 1
+all_weights_unconstrained <- data.table(all_weights_unconstrained)
+colnames(all_weights_unconstrained) <- tickers
+all_weights_unconstrained[, row_sum := rowSums(.SD), .SDcols = tickers] #Check portfolio weights total to 1
+all_weights_unconstrained[,row_sum := NULL]
+
+
+# Calculate portfolio risk and returns (unconstrained)
+portfolio_risk_unconstrained <- apply(all_weights_unconstrained, 1, function(weights) sqrt(t(weights) %*% cov_mat %*% weights))
+portfolio_returns_unconstrained <- apply(all_weights_unconstrained, 1, function(weights) sum(weights * mean_ret))
+
+# Create data table with portfolio risk, returns, and Sharpe ratio (unconstrained)
+portfolio_df_unconstrained <- data.table(portfolio_risk_unconstrained, portfolio_returns_unconstrained)
+
+# Generate random weights (constrained: no short-selling)
+random_numbers_constrained <- runif(total_run)
+all_weights_constrained <- matrix(random_numbers_constrained, nrow = 10000, ncol = length(tickers))
+
+# Normalize the weights to sum to 1 (constrained)
+for (i in 1:10000) {
+  all_weights_constrained[i, ] <- all_weights_constrained[i, ] / sum(all_weights_constrained[i, ])
+}
+
+# Convert to data table (constrained)
+all_weights_constrained <- data.table(all_weights_constrained)
+colnames(all_weights_constrained) <- tickers
+
+# Calculate portfolio risk and returns (constrained)
+portfolio_risk_constrained <- apply(all_weights_constrained, 1, function(weights) sqrt(t(weights) %*% cov_mat %*% weights))
+portfolio_returns_constrained <- apply(all_weights_constrained, 1, function(weights) sum(weights * mean_ret))
+
+portfolio_downside_risk_unconstrained <- apply(all_weights_unconstrained, 1, function(weights) {
+  portfolio_returns <- ret_xts %*% weights
+  downside_deviation(portfolio_returns)
+})
+
+# Create data table with portfolio risk, returns, and ratios (unconstrained)
+portfolio_df_unconstrained <- data.table(portfolio_risk_unconstrained, portfolio_returns_unconstrained)
+portfolio_df_unconstrained[, sortino_ratio := (portfolio_returns_unconstrained - risk_free_rate) / portfolio_downside_risk_unconstrained]
+
+# Find the portfolios with the highest Sharpe, Sortino, and Treynor ratios (unconstrained)
+best_sortino_unconstrained <- portfolio_df_unconstrained[which.max(sortino_ratio)]
+
+# Generate random weights for constrained (no short-selling) portfolios
+all_weights_constrained <- t(replicate(10000, generate_random_weights(length(tickers), allow_short = FALSE)))
+
+# Convert to data table (constrained)
+all_weights_constrained <- data.table(all_weights_constrained)
+colnames(all_weights_constrained) <- tickers
+
+# Calculate portfolio risk and returns (constrained)
+portfolio_risk_constrained <- apply(all_weights_constrained, 1, function(weights) sqrt(t(weights) %*% cov_mat %*% weights))
+portfolio_returns_constrained <- apply(all_weights_constrained, 1, function(weights) sum(weights * mean_ret))
+
+# Calculate downside deviation for Sortino ratio
+portfolio_downside_risk_constrained <- apply(all_weights_constrained, 1, function(weights) {
+  portfolio_returns <- ret_xts %*% weights
+  downside_deviation(portfolio_returns)
+})
+
+# Create data table with portfolio risk, returns, and ratios (constrained)
+portfolio_df_constrained <- data.table(portfolio_risk_constrained, portfolio_returns_constrained)
+portfolio_df_constrained[, sortino_ratio := (portfolio_returns_constrained - risk_free_rate) / portfolio_downside_risk_constrained]
+
+# Find the portfolios with the highest Sharpe, Sortino, and Treynor ratios (constrained)
+best_sortino_constrained <- portfolio_df_constrained[which.max(sortino_ratio)]
+
+# Plot the efficient frontiers for unconstrained portfolios
+plot_unconstrained <- ggplot(portfolio_df_unconstrained, aes(x = portfolio_risk_unconstrained, y = portfolio_returns_unconstrained)) + 
+  geom_point(color = "blue", alpha = 0.5) + 
+  geom_point(aes(x = best_sortino_unconstrained$portfolio_risk_unconstrained, y = best_sortino_unconstrained$portfolio_returns_unconstrained), color = "darkgreen", size = 4) +
+  labs(title = "Efficient Frontier (Unconstrained)", 
+       x = "Daily Risk (Standard Deviation)", 
+       y = "Daily Return") + 
+  theme_minimal() +
+    ylim(-0.25,0.25) +
+    xlim(0,2.5) +
+  annotate("text", x = 1.5, y = -0.05,
+           label = paste0("Best Sortino\nReturn: ", round(best_sortino_unconstrained$portfolio_returns_unconstrained, 2), 
+                          "\nRisk: ", round(best_sortino_unconstrained$portfolio_risk_unconstrained, 2),
+                           "\nSortino Ratio: ", round(best_sortino_unconstrained$sortino_ratio, 2)), 
+           hjust = 0, vjust = 0, color = "darkgreen") 
+
+# Plot the efficient frontiers for constrained portfolios
+plot_constrained <- ggplot(portfolio_df_constrained, aes(x = portfolio_risk_constrained, y = portfolio_returns_constrained)) + 
+  geom_point(color = "blue", alpha = 0.5) + 
+  geom_point(aes(x = best_sortino_constrained$portfolio_risk_constrained, y = best_sortino_constrained$portfolio_returns_constrained), color = "darkgreen", size = 4) +
+  labs(title = "Efficient Frontier (Constrained)",
+       x = "Daily Risk (Standard Deviation)",
+       y = "Daily Return") +
+  theme_minimal() +
+    ylim(-0.25, 0.25) +
+    xlim(0,2.5) +
+  annotate("text", x =2.0 , y = -0.05, 
+           label = paste0("Best Sortino\nReturn: ", round(best_sortino_constrained$portfolio_returns_constrained, 2), 
+                          "\nRisk: ", round(best_sortino_constrained$portfolio_risk_constrained, 2),
+                          "\nSortino Ratio: ", round(best_sortino_constrained$sortino_ratio, 2)), 
+           hjust = 0, vjust = 0, color = "darkgreen") 
+
+plot_unconstrained
+plot_constrained
+
+```
+
+```{r print my choice of portfolio, echo = F}
+
+if(max(portfolio_df_unconstrained$sortino_ratio) > max(portfolio_df_constrained$sortino_ratio)){
+    print(paste0("My portfolio selection is listed below and it is the best sortino ratio portfoilio without short constrain. The weight of each ticker is displayed where the whole portfolio = 1."))
+cbind(all_weights_unconstrained[which.max(portfolio_df_unconstrained$sortino_ratio)], portfolio_df_unconstrained[which.max(portfolio_df_unconstrained$sortino_ratio)], data.table(risk_free_rate_used = risk_free_rate))}else{
+  print(paste0("My portfolio selection is listed below and it is the best sortino ratio portfolio with short constrain. The weight of each ticker is displayed where the whole portfolio = 1."))
+cbind(all_weights_constrained[which.max(portfolio_df_constrained$sortino_ratio)], portfolio_df_constrained[which.max(portfolio_df_constrained$sortino_ratio)], data.table(risk_free_rate_used = risk_free_rate))}
+
+```
+
+
+## E) If you wanted to invest in 200 equities, explain any difficulties in computing the covariance matrix and how these can be overcome.
+One of the issues with scaling this analysis to a larger list of tickers is complexity and the computational toll to calculate the covariance for all the pair variations for 200 tickers. In order to combat this, I would reduce the number of dimensions, such as PCA or factor models. Also, it would be worthwhile to use parallel computing to speed up the computation.  
+
+
+
+
+
+
+
+
+
+
+
